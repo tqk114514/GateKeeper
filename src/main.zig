@@ -53,6 +53,7 @@ pub fn main() !void {
         .{
             .ptr = &proxy,
             .onHeader = ProxyContext.onHeader,
+            .onPumping = ProxyContext.onPumping,
             .onBackendError = ProxyContext.onBackendError,
         },
     );
@@ -107,6 +108,7 @@ const ProxyContext = struct {
         };
 
         const real_ip = try extractRealIP(data, socket_ip);
+        conn.real_ip_cached = real_ip;
 
         // 2. 安全检查
         if (try self.ip_index.isBlocked(real_ip)) return false;
@@ -137,6 +139,31 @@ const ProxyContext = struct {
         conn.server_fd = s_fd;
         conn.state = .BACKEND_CONNECTING;
         try engine.addFD(s_fd, slot, .server);
+        return true;
+    }
+
+    pub fn onPumping(ptr: *anyopaque, engine: *reactor.Engine, slot: usize, data: []const u8) anyerror!bool {
+        const self: *ProxyContext = @ptrCast(@alignCast(ptr));
+        const conn = &engine.conn_pool[slot].?;
+
+        // 探测新的 HTTP 请求特征 (Keep-Alive 场景)
+        const methods = [_][]const u8{ "GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH " };
+        var is_new_req = false;
+        for (methods) |m| {
+            if (std.mem.startsWith(u8, data, m)) {
+                is_new_req = true;
+                break;
+            }
+        }
+
+        if (is_new_req) {
+            // 如果是新请求，重新执行频率限制检查
+            if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) {
+                std.debug.print("[SECURITY] Keep-Alive rate limit triggered for IP: 0x{X}\n", .{conn.real_ip_cached});
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -184,13 +211,27 @@ fn cleanupTask(rate_limiter: *@import("utils/ratelimit.zig").RateLimiter) void {
 
 fn extractRealIP(buffer: []const u8, socket_ip: u32) !u32 {
     const index_mod = @import("utils/index.zig");
+    // 仅在来自本地回环（如 Nginx/Cloudflare Tunnel 转发）时尝试提取真实 IP
     if (socket_ip != 0x7F000001) return socket_ip;
-    const cf_header = "CF-Connecting-IP: ";
-    if (std.mem.indexOf(u8, buffer, cf_header)) |pos| {
-        const start = pos + cf_header.len;
-        if (std.mem.indexOfScalar(u8, buffer[start..], '\r')) |end_rel| {
-            return index_mod.parseIPv4(buffer[start .. start + end_rel]);
+
+    const cf_header = "CF-Connecting-IP:";
+
+    // 1. 寻找 HTTP Header 部分的起点（跳过请求行）
+    const first_line_end = std.mem.indexOf(u8, buffer, "\r\n") orelse return socket_ip;
+    const remaining = buffer[first_line_end + 2 ..];
+
+    // 2. 逐行迭代扫描 Headers
+    var it = std.mem.splitSequence(u8, remaining, "\r\n");
+    while (it.next()) |line| {
+        // 如果遇到空行，说明 Header 结束
+        if (line.len == 0) break;
+
+        // 严格匹配：必须以 CF-Connecting-IP: 开头 (忽略大小写可通过更复杂的解析处理，这里先保证行首匹配)
+        if (std.mem.startsWith(u8, line, cf_header)) {
+            const val = std.mem.trim(u8, line[cf_header.len..], " ");
+            return index_mod.parseIPv4(val) catch socket_ip;
         }
     }
+
     return socket_ip;
 }

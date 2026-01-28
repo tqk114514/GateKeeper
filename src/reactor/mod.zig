@@ -45,6 +45,7 @@ pub const Connection = struct {
 
     start_time: i64,
     last_activity: i64,
+    real_ip_cached: u32 = 0, // 缓存 IP 供 PUMPING 阶段二次检查使用
 
     // 业务预留：允许上层存放自定义数据（如重试次数等）
     context: ?*anyopaque = null,
@@ -66,6 +67,8 @@ pub const EventHandler = struct {
     ptr: *anyopaque,
     // 当收到第一波数据，由上层决定是否允许连接，并启动后端连接
     onHeader: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize, data: []const u8) anyerror!bool,
+    // 当数据在 PUMPING 阶段从客户端流向服务端时，允许上层进行二次检查（如探测新请求）
+    onPumping: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize, data: []const u8) anyerror!bool,
     // 当后端连接出事（失败/断开）时的处理逻辑
     onBackendError: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize) anyerror!void,
 };
@@ -315,6 +318,10 @@ pub const Engine = struct {
                     const n = posix.read(src_fd, buf[len.*..]) catch 0;
                     if (n == 0) return false;
                     if (n > 0) {
+                        if (kind == .client) {
+                            // 允许上层业务逻辑在转发过程中探测新的 HTTP 请求
+                            if (!(try self.handler.onPumping(self.handler.ptr, self, slot_index, buf[len.* .. len.* + n]))) return false;
+                        }
                         len.* += n;
                         conn.last_activity = getMonotonicMs();
                     }
