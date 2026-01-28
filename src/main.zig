@@ -34,7 +34,7 @@ fn isTrustedProxy(ip: u32) bool {
     return false;
 }
 
-fn sendErrorResponse(fd: posix.socket_t, code: []const u8, reason: []const u8, body: []const u8) !void {
+fn sendErrorResponse(conn: *reactor.Connection, code: []const u8, reason: []const u8, body: []const u8) !void {
     const header =
         "HTTP/1.1 {s} {s}\r\n" ++
         "Content-Type: text/plain\r\n" ++
@@ -45,8 +45,52 @@ fn sendErrorResponse(fd: posix.socket_t, code: []const u8, reason: []const u8, b
     var buf: [512]u8 = undefined;
     const msg = try std.fmt.bufPrint(&buf, header, .{ code, reason, body.len });
 
-    _ = try posix.write(fd, msg);
-    _ = try posix.write(fd, body);
+    // 尝试直接发送
+    var total_sent: usize = 0;
+    const iov = [_]posix.iovec_const{
+        .{ .base = msg.ptr, .len = msg.len },
+        .{ .base = body.ptr, .len = body.len },
+    };
+
+    // 使用 writev 尝试一次性发送 header + body
+    if (posix.writev(conn.client_fd, &iov)) |n| {
+        total_sent = n;
+    } else |err| {
+        if (err != error.WouldBlock) return err;
+    }
+
+    const total_len = msg.len + body.len;
+    if (total_sent < total_len) {
+        // 发送不完整，需要缓冲剩余部分并进入 FLUSHING 状态
+        // 我们利用 s2c_buf 作为缓冲 (假设此时没有正常的后端转发数据)
+        conn.s2c_len = 0;
+        conn.s2c_sent = 0;
+
+        var remaining = total_len - total_sent;
+        var offset: usize = 0;
+
+        // 填充 msg 剩余部分
+        if (total_sent < msg.len) {
+            const part = msg[total_sent..];
+            @memcpy(conn.s2c_buf[offset..][0..part.len], part);
+            offset += part.len;
+            remaining -= part.len;
+        }
+
+        // 填充 body 剩余部分
+        if (remaining > 0) {
+            const body_sent = if (total_sent > msg.len) total_sent - msg.len else 0;
+            const part = body[body_sent..];
+            @memcpy(conn.s2c_buf[offset..][0..part.len], part);
+            offset += part.len;
+        }
+
+        conn.s2c_len = offset;
+        conn.state = .FLUSHING;
+    } else {
+        // 发送完毕
+        conn.state = .CLOSING;
+    }
 }
 
 pub fn main() !void {
@@ -89,6 +133,7 @@ pub fn main() !void {
             .onHeader = ProxyContext.onHeader,
             .onPumping = ProxyContext.onPumping,
             .onBackendError = ProxyContext.onBackendError,
+            .onKeepAlive = ProxyContext.onKeepAlive,
         },
     );
     defer engine.deinit();
@@ -144,6 +189,7 @@ const ProxyContext = struct {
         http_state: HttpState = .IDLE,
         body_remaining: usize = 0,
         chunk_remaining: usize = 0, // 当前正在处理的 chunk 剩余大小
+        total_read: usize = 0, // 累计流量 (for Slowloris check)
     };
 
     pub fn onHeader(ptr: *anyopaque, engine: *reactor.Engine, slot: usize, data: []const u8) anyerror!bool {
@@ -156,6 +202,8 @@ const ProxyContext = struct {
             meta.* = .{};
             conn.context = meta;
         }
+        var meta: *ConnMeta = @ptrCast(@alignCast(conn.context.?));
+        meta.total_read += data.len;
 
         // 1. 累积 Header 数据 (利用 s2c_buf 作为临时存储，最大 16KB)
         // 防止 Header 被切分导致 extractRealIP 找不到关键字
@@ -225,6 +273,7 @@ const ProxyContext = struct {
         const self: *ProxyContext = @ptrCast(@alignCast(ptr));
         const conn = &engine.conn_pool[slot].?;
         var meta: *ConnMeta = @ptrCast(@alignCast(conn.context.?));
+        meta.total_read += data.len;
 
         // 1. 构造跨包视图：[上一包尾部] + [当前包]
         // 使用非常小的栈上缓冲，避免动态分配
@@ -380,7 +429,7 @@ const ProxyContext = struct {
 
     pub fn onBackendError(ptr: *anyopaque, engine: *reactor.Engine, slot: usize) anyerror!void {
         const self: *ProxyContext = @ptrCast(@alignCast(ptr));
-        var conn = &engine.conn_pool[slot].?;
+        const conn = &engine.conn_pool[slot].?;
 
         self.consecutive_failures += 1;
         self.last_failure_time = reactor.getMonotonicMs();
@@ -403,12 +452,36 @@ const ProxyContext = struct {
             std.debug.print("[PROXY] Retrying backend {d}/3...\n", .{meta.retries});
             _ = try self.connectToBackend(engine, slot);
         } else {
-            // 发送 502 并标记关闭
-            sendErrorResponse(conn.client_fd, "502", "Bad Gateway", "Gatekeeper: Backend Unreachable after retries.") catch {};
-            conn.state = .CLOSING;
+            // 发送 502 并标记关闭 (由 sendErrorResponse 管理状态：FLUSHING 或 CLOSING)
+            sendErrorResponse(conn, "502", "Bad Gateway", "Gatekeeper: Backend Unreachable after retries.") catch {};
+            // 注意：不要在这里强制设置 CLOSING，因为 sendErrorResponse 可能置为 FLUSHING
             engine.allocator.destroy(meta);
             conn.context = null;
         }
+    }
+
+    pub fn onKeepAlive(ptr: *anyopaque, engine: *reactor.Engine, slot: usize) anyerror!bool {
+        _ = ptr;
+        const conn = &engine.conn_pool[slot].?;
+        if (conn.context == null) return true; // 还没发数据，由基础 Header Timeout 控制
+
+        const meta: *ConnMeta = @ptrCast(@alignCast(conn.context.?));
+        const now = reactor.getMonotonicMs();
+        const duration = now - conn.start_time;
+
+        const MIN_RATE = 15; // 15 bytes/sec (Relaxed for bad networks)
+
+        // 宽限期 10 秒
+        if (duration < 10000) return true;
+
+        if (meta.total_read == 0) return false; // 10s 还没发任何数据，杀
+
+        const rate = meta.total_read * 1000 / @as(usize, @intCast(duration));
+        if (rate < MIN_RATE) {
+            std.debug.print("[SECURITY] Slowloris Detected: Rate {} B/s < {} B/s IP:{}\n", .{ rate, MIN_RATE, conn.real_ip_cached });
+            return false;
+        }
+        return true;
     }
 };
 

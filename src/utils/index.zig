@@ -85,6 +85,18 @@ const IPEntry = packed struct {
     }
 };
 
+/// Interval IP 区间 (闭区间 [start, end])
+const Interval = struct {
+    start: u32,
+    end: u32,
+
+    pub fn format(value: Interval, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        try writer.print("[{d}, {d}]", .{ value.start, value.end });
+    }
+};
+
 /// IndexReader 索引读取器（内存缓存版本）
 pub const IndexReader = struct {
     segments: [SEGMENT_COUNT]SegmentData,
@@ -92,7 +104,7 @@ pub const IndexReader = struct {
 
     const SegmentData = struct {
         ips: []u32, // /32 IP 列表（已排序，用于二分查找）
-        ranges: []IPEntry, // CIDR 网段列表（通常数量较少，使用线性扫描）
+        ranges: []Interval, // 合并后的不重叠 CIDR 区间（已排序，支持 O(log N) 二分查找）
     };
 
     /// init 初始化索引读取器
@@ -124,7 +136,7 @@ pub const IndexReader = struct {
 
         for (segment_table, 0..) |seg_entry, i| {
             if (seg_entry.count == 0) {
-                segments[i] = SegmentData{ .ips = &[_]u32{}, .ranges = &[_]IPEntry{} };
+                segments[i] = SegmentData{ .ips = &[_]u32{}, .ranges = &[_]Interval{} };
                 continue;
             }
 
@@ -137,28 +149,58 @@ pub const IndexReader = struct {
 
             for (raw_entries) |*entry| entry.fromLittleEndian();
 
-            // 2. 统计 /32 IP 的数量
+            // 2. 统计 /32 IP 并收集 CIDR 区间
             var ip_count: usize = 0;
+            var temp_intervals: std.ArrayListUnmanaged(Interval) = .empty;
+            defer temp_intervals.deinit(allocator);
+
             for (raw_entries) |entry| {
-                if (entry.mask == 0xFFFFFFFF) ip_count += 1;
+                if (entry.mask == 0xFFFFFFFF) {
+                    ip_count += 1;
+                } else {
+                    const start = entry.ip;
+                    // mask 0xFF000000 -> size 0x01000000 -> end = start + size - 1
+                    // end = start | ~mask
+                    const end = start | ~entry.mask;
+                    try temp_intervals.append(allocator, .{ .start = start, .end = end });
+                }
             }
 
             // 3. 分配内存并拆分数据
             const ips = try allocator.alloc(u32, ip_count);
             errdefer allocator.free(ips);
 
-            const ranges = try allocator.alloc(IPEntry, seg_entry.count - ip_count);
+            // 4. 对区间进行合并 (Merge Overlapping Intervals)
+            // 假设 raw_entries 已经按 start 排序，temp_intervals 自然也是按 start 排序的
+            var merged_intervals: std.ArrayListUnmanaged(Interval) = .empty;
+            defer merged_intervals.deinit(allocator);
+
+            if (temp_intervals.items.len > 0) {
+                var current = temp_intervals.items[0];
+                for (temp_intervals.items[1..]) |next| {
+                    // 如果重叠或相邻 (end + 1 >= next.start)
+                    // 注意防止 u32 溢出：如果 current.end 是 UINT_MAX，则 next.start 必然也是 (如果要 merge)
+                    // 但由于 sort，next.start >= current.start。
+                    // 只要 next.start <= current.end + 1，不仅重叠还能合并相邻
+                    // use u64 to avoid overflow
+                    if (@as(u64, next.start) <= @as(u64, current.end) + 1) {
+                        if (next.end > current.end) current.end = next.end;
+                    } else {
+                        try merged_intervals.append(allocator, current);
+                        current = next;
+                    }
+                }
+                try merged_intervals.append(allocator, current);
+            }
+
+            const ranges = try merged_intervals.toOwnedSlice(allocator);
             errdefer allocator.free(ranges);
 
             var ip_idx: usize = 0;
-            var range_idx: usize = 0;
             for (raw_entries) |entry| {
                 if (entry.mask == 0xFFFFFFFF) {
                     ips[ip_idx] = entry.ip;
                     ip_idx += 1;
-                } else {
-                    ranges[range_idx] = entry;
-                    range_idx += 1;
                 }
             }
 
@@ -168,7 +210,7 @@ pub const IndexReader = struct {
             };
         }
 
-        std.debug.print("Index loaded: {d} segments partitioned into IPs and Ranges\n", .{SEGMENT_COUNT});
+        std.debug.print("Index loaded: {d} segments partitioned into IPs and Merged Ranges\n", .{SEGMENT_COUNT});
 
         return IndexReader{
             .segments = segments,
@@ -202,11 +244,23 @@ pub const IndexReader = struct {
             return true;
         }
 
-        // 2. 检查 CIDR 网段列表 (O(M))
-        for (data.ranges) |range| {
-            if ((ip & range.mask) == range.ip) {
-                return true;
+        // 2. 检查 CIDR 网段列表 (O(log M) - Binary Search)
+        // ranges 已经是合并后的不重叠区间，按 start 排序
+        const IntervalComp = struct {
+            fn compare(context: u32, item: Interval) std.math.Order {
+                // 我们只需要找第一个 start > ip 的区间
+                return std.math.order(context, item.start);
             }
+        };
+
+        // 找到第一个 start > ip 的区间索引
+        const idx = std.sort.upperBound(Interval, data.ranges, ip, IntervalComp.compare);
+
+        // 如果 idx > 0，说明前一个区间 (idx - 1) 的 start <= ip
+        // 我们只需要检查该区间的 end 是否覆盖 ip
+        if (idx > 0) {
+            const candidate = data.ranges[idx - 1];
+            if (candidate.end >= ip) return true;
         }
 
         return false;

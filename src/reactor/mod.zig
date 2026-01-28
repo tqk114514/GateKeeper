@@ -24,6 +24,7 @@ pub const ConnState = enum {
     HEADER_PENDING, // 等待读入足以探测 IP 的头部数据
     BACKEND_CONNECTING, // 正在异步建立后端连接
     PUMPING, // 正常双向转发数据
+    FLUSHING, // 发送剩余数据后关闭 (Graceful Shutdown)
     CLOSING, // 标记为关闭，等待清理
 };
 
@@ -71,6 +72,8 @@ pub const EventHandler = struct {
     onPumping: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize, data: []const u8) anyerror!bool,
     // 当后端连接出事（失败/断开）时的处理逻辑
     onBackendError: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize) anyerror!void,
+    // 定期检查连接是否健康 (Slowloris 防御 hook)
+    onKeepAlive: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize) anyerror!bool,
 };
 
 /// Engine 反应器引擎
@@ -249,7 +252,15 @@ pub const Engine = struct {
             var timeout_ms: i64 = 30_000;
             if (conn.state == .HEADER_PENDING) timeout_ms = 5_000; // Slowloris mitigation
 
+            var keep = true;
             if (now - conn.last_activity > timeout_ms) {
+                keep = false;
+            } else {
+                // Business Logic Check (e.g. Min Data Rate)
+                keep = self.handler.onKeepAlive(self.handler.ptr, self, meta.slot_index) catch false;
+            }
+
+            if (!keep) {
                 self.removeFDsForSlot(meta.slot_index);
                 i = 1;
             } else {
@@ -346,6 +357,24 @@ pub const Engine = struct {
                     }
                 }
             },
+            .FLUSHING => {
+                // FLUSHING 状态下，只关注将 s2c_buf 发送给 Client
+                if (kind == .client and (revents & posix.POLL.OUT != 0)) {
+                    const buf = &conn.s2c_buf;
+                    const len = conn.s2c_len;
+                    const sent = &conn.s2c_sent;
+
+                    const n = posix.write(conn.client_fd, buf[sent.*..len]) catch 0;
+                    if (n > 0) {
+                        sent.* += n;
+                        conn.last_activity = getMonotonicMs();
+                        if (sent.* == len) {
+                            // 全部发送完毕，进入 CLOSING
+                            conn.state = .CLOSING;
+                        }
+                    }
+                }
+            },
             else => {},
         }
         return true;
@@ -363,11 +392,16 @@ pub const Engine = struct {
                 desired_events = posix.POLL.OUT;
             },
             .PUMPING => {
-                const in_len = if (meta.kind == .client) conn.c2s_len else conn.s2c_len;
                 const out_len = if (meta.kind == .client) conn.s2c_len else conn.c2s_len;
                 const out_sent = if (meta.kind == .client) conn.s2c_sent else conn.c2s_sent;
-                if (in_len < self.buffer_size) desired_events |= posix.POLL.IN;
                 if (out_len > out_sent) desired_events |= posix.POLL.OUT;
+
+                // Allow POLLIN if buffer has space
+                const in_len = if (meta.kind == .client) conn.c2s_len else conn.s2c_len;
+                if (in_len < self.buffer_size) desired_events |= posix.POLL.IN;
+            },
+            .FLUSHING => if (meta.kind == .client) {
+                if (conn.s2c_len > conn.s2c_sent) desired_events |= posix.POLL.OUT;
             },
             else => {},
         }
