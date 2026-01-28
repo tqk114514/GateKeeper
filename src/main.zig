@@ -245,23 +245,10 @@ fn extractRealIP(buffer: []const u8, socket_ip: u32) !u32 {
     // 仅在来自本地回环（如 Nginx/Cloudflare Tunnel 转发）时尝试提取真实 IP
     if (socket_ip != 0x7F000001) return socket_ip;
 
-    const cf_header = "CF-Connecting-IP:";
-
-    // 1. 寻找 HTTP Header 部分的起点（跳过请求行）
-    const first_line_end = std.mem.indexOf(u8, buffer, "\r\n") orelse return socket_ip;
-    const remaining = buffer[first_line_end + 2 ..];
-
-    // 2. 逐行迭代扫描 Headers
-    var it = std.mem.splitSequence(u8, remaining, "\r\n");
-    while (it.next()) |line| {
-        // 如果遇到空行，说明 Header 结束
-        if (line.len == 0) break;
-
-        // 严格匹配：必须以 CF-Connecting-IP: 开头 (忽略大小写可通过更复杂的解析处理，这里先保证行首匹配)
-        if (std.mem.startsWith(u8, line, cf_header)) {
-            const val = std.mem.trim(u8, line[cf_header.len..], " ");
-            return index_mod.parseIPv4(val) catch socket_ip;
-        }
+    // 2. 使用安全解析器提取 IP
+    const http_mod = @import("utils/http.zig");
+    if (http_mod.findHeaderValue(buffer, "CF-Connecting-IP")) |val| {
+        return index_mod.parseIPv4(val) catch socket_ip;
     }
 
     return socket_ip;
