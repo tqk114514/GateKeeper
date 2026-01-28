@@ -92,6 +92,9 @@ const ProxyContext = struct {
     /// 内部连接元数据（存放重试次数等）
     const ConnMeta = struct {
         retries: u8 = 0,
+        // TCP 分片重组缓冲区 (最大方法长度 "OPTIONS " = 8)
+        frag_buf: [8]u8 = undefined,
+        frag_len: usize = 0,
     };
 
     pub fn onHeader(ptr: *anyopaque, engine: *reactor.Engine, slot: usize, data: []const u8) anyerror!bool {
@@ -145,23 +148,51 @@ const ProxyContext = struct {
     pub fn onPumping(ptr: *anyopaque, engine: *reactor.Engine, slot: usize, data: []const u8) anyerror!bool {
         const self: *ProxyContext = @ptrCast(@alignCast(ptr));
         const conn = &engine.conn_pool[slot].?;
+        var meta: *ConnMeta = @ptrCast(@alignCast(conn.context.?));
 
-        // 探测新的 HTTP 请求特征 (Keep-Alive 场景)
+        // 1. 构造跨包视图：[上一包尾部] + [当前包]
+        // 使用非常小的栈上缓冲，避免动态分配
+        var combined_buf: [16 * 1024 + 8]u8 = undefined;
+        // 安全检查：防止栈溢出 (虽然 reactor 限制了 read buffer size)
+        if (meta.frag_len + data.len > combined_buf.len) return false;
+
+        @memcpy(combined_buf[0..meta.frag_len], meta.frag_buf[0..meta.frag_len]);
+        @memcpy(combined_buf[meta.frag_len .. meta.frag_len + data.len], data);
+
+        const view_data = combined_buf[0 .. meta.frag_len + data.len];
+
+        // 2. 探测潜藏在数据包中的多重 HTTP 请求 (Pipeline/粘包场景)
         const methods = [_][]const u8{ "GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH " };
-        var is_new_req = false;
+
         for (methods) |m| {
-            if (std.mem.startsWith(u8, data, m)) {
-                is_new_req = true;
-                break;
+            var index: usize = 0;
+            while (std.mem.indexOfPos(u8, view_data, index, m)) |pos| {
+                // 检查是否为独立行的开始
+                const is_start_line = (pos == 0) or (view_data[pos - 1] == '\n');
+
+                if (is_start_line) {
+                    if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) {
+                        std.debug.print("[SECURITY] Pipelining rate limit triggered for IP: 0x{X}\n", .{conn.real_ip_cached});
+                        return false;
+                    }
+                }
+                index = pos + 1;
             }
         }
 
-        if (is_new_req) {
-            // 如果是新请求，重新执行频率限制检查
-            if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) {
-                std.debug.print("[SECURITY] Keep-Alive rate limit triggered for IP: 0x{X}\n", .{conn.real_ip_cached});
-                return false;
+        // 3. 更新尾部缓冲 (滚动追加模式)
+        if (data.len >= 8) {
+            @memcpy(meta.frag_buf[0..8], data[data.len - 8 ..]);
+            meta.frag_len = 8;
+        } else {
+            const space_needed = 8 - data.len;
+            const keep_existing = @min(meta.frag_len, space_needed);
+
+            if (keep_existing > 0) {
+                std.mem.copyForwards(u8, meta.frag_buf[0..keep_existing], meta.frag_buf[meta.frag_len - keep_existing .. meta.frag_len]);
             }
+            @memcpy(meta.frag_buf[keep_existing .. keep_existing + data.len], data);
+            meta.frag_len = keep_existing + data.len;
         }
 
         return true;

@@ -45,7 +45,7 @@ pub const Connection = struct {
 
     start_time: i64,
     last_activity: i64,
-    real_ip_cached: u32 = 0, // 缓存 IP 供 PUMPING 阶段二次检查使用
+    real_ip_cached: u32 = 0,
 
     // 业务预留：允许上层存放自定义数据（如重试次数等）
     context: ?*anyopaque = null,
