@@ -58,3 +58,10 @@ pub fn findHeaderValue(buffer: []const u8, target_header: []const u8) ?[]const u
 
     return null;
 }
+
+pub fn parseContentLength(buffer: []const u8) usize {
+    if (findHeaderValue(buffer, "Content-Length")) |val| {
+        return std.fmt.parseInt(usize, val, 10) catch 0;
+    }
+    return 0;
+}

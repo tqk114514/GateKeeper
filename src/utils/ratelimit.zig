@@ -164,12 +164,11 @@ pub const RateLimiter = struct {
         if (record == null) {
             // 内存熔断保护：如果当前 Shard 追踪 IP 数过多，触发紧急清理
             if (shard.map.count() >= MAX_IPS_PER_SHARD) {
-                // 简单策略：拒绝新 IP 追踪（相当于放行，因为没有记录历史），或者更激进地由 cleanupTask 负责
-                // 这里选择激进清空：为了防止 OOM，丢弃当前 Shard 所有记录
-                // 虽然会重置该 Shard 下所有 IP 的限制，但保命优先
-                var iter = shard.map.valueIterator();
-                while (iter.next()) |rec| rec.deinit();
-                shard.map.clearRetainingCapacity();
+                // Fail Closed 策略：
+                // 当分片已满且没有过期条目被 cleanupTask 清理掉时，说明遭受了持续的高强度攻击。
+                // 此时拒绝追踪新 IP（直接视为被限流/拒绝服务）是保护系统内存和现有限流状态的唯一安全手段。
+                // 绝对不能清空 Map，否则攻击者会利用它重置自己的计数器。
+                return false;
             }
 
             var new_record = IPRecord.init(self.allocator);

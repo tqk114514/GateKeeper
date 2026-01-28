@@ -89,12 +89,22 @@ const ProxyContext = struct {
     const HEALTH_THRESHOLD = 5;
     const COOLING_PERIOD_MS = 10000;
 
+    const HttpState = enum {
+        IDLE,
+        HEADERS,
+        BODY,
+    };
+
     /// 内部连接元数据（存放重试次数等）
     const ConnMeta = struct {
         retries: u8 = 0,
         // TCP 分片重组缓冲区 (最大方法长度 "OPTIONS " = 8)
         frag_buf: [8]u8 = undefined,
         frag_len: usize = 0,
+
+        // HTTP 状态机 - 防止 False Positive 和 Smuggling
+        http_state: HttpState = .IDLE,
+        body_remaining: usize = 0,
     };
 
     pub fn onHeader(ptr: *anyopaque, engine: *reactor.Engine, slot: usize, data: []const u8) anyerror!bool {
@@ -161,22 +171,59 @@ const ProxyContext = struct {
 
         const view_data = combined_buf[0 .. meta.frag_len + data.len];
 
-        // 2. 探测潜藏在数据包中的多重 HTTP 请求 (Pipeline/粘包场景)
-        const methods = [_][]const u8{ "GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH " };
+        // 2. HTTP 状态机流式处理
+        const http_mod = @import("utils/http.zig");
+        var cursor: usize = 0;
+        const total_len = meta.frag_len + data.len;
 
-        for (methods) |m| {
-            var index: usize = 0;
-            while (std.mem.indexOfPos(u8, view_data, index, m)) |pos| {
-                // 检查是否为独立行的开始
-                const is_start_line = (pos == 0) or (view_data[pos - 1] == '\n');
-
-                if (is_start_line) {
-                    if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) {
-                        std.debug.print("[SECURITY] Pipelining rate limit triggered for IP: 0x{X}\n", .{conn.real_ip_cached});
-                        return false;
+        while (cursor < total_len) {
+            switch (meta.http_state) {
+                .BODY => {
+                    const available = total_len - cursor;
+                    const consume = @min(available, meta.body_remaining);
+                    meta.body_remaining -= consume;
+                    cursor += consume;
+                    if (meta.body_remaining == 0) {
+                        meta.http_state = .IDLE; // Body 结束，准备处理下一个请求
                     }
-                }
-                index = pos + 1;
+                },
+                .IDLE, .HEADERS => {
+                    // IDLE/HEADERS 状态下需要扫描 \r\n\r\n
+                    // 我们只扫描 view_data[cursor..]
+                    const slice = view_data[cursor..];
+
+                    // 1. 如果还在 IDLE，探测 Method
+                    if (meta.http_state == .IDLE) {
+                        const methods = [_][]const u8{ "GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH " };
+                        for (methods) |m| {
+                            if (std.mem.startsWith(u8, slice, m)) {
+                                if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) return false;
+                                meta.http_state = .HEADERS;
+                                break;
+                            }
+                        }
+                        // 如果是 IDLE 但开头不是 Method，可能是 Pipeline 中的 \r\n 残留，也可能是非法数据
+                        // 简单起见，我们默认切到 HEADERS 模式寻找结尾，或者继续等待
+                        if (meta.http_state == .IDLE) meta.http_state = .HEADERS;
+                    }
+
+                    // 2. 寻找 Header 结束符
+                    if (std.mem.indexOf(u8, slice, "\r\n\r\n")) |end_pos| {
+                        // 找到 Header 结束
+                        const header_bytes = slice[0 .. end_pos + 4];
+                        const cl = http_mod.parseContentLength(header_bytes);
+
+                        meta.http_state = .BODY;
+                        meta.body_remaining = cl;
+
+                        // 移动 cursor 越过 Header
+                        cursor += end_pos + 4;
+                    } else {
+                        // 没找到 Header 结束符，说明 Header 跨包了
+                        // 这一整块数据都是 Header 的一部分
+                        cursor = total_len; // 消耗完
+                    }
+                },
             }
         }
 
