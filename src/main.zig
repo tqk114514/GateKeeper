@@ -335,12 +335,11 @@ const ProxyContext = struct {
                         // 找到 Header 结束
                         const header_bytes = slice[0 .. end_pos + 4];
 
-                        // 防走私检查
-                        if (http_mod.hasSmugglingRisk(header_bytes)) {
-                            // 发现 CL.TE 冲突，直接断开
-                            std.debug.print("[SECURITY] Smuggling attempted IP:{}\n", .{conn.real_ip_cached});
+                        // 严格 Header 合法性校验 (Obs-fold, Duplicate Headers)
+                        http_mod.validateHeaderSection(header_bytes) catch |err| {
+                            std.debug.print("[SECURITY] Invalid Header: {} IP:{}\n", .{ err, conn.real_ip_cached });
                             return false;
-                        }
+                        };
 
                         if (http_mod.isChunked(header_bytes)) {
                             meta.http_state = .CHUNK_SIZE;
