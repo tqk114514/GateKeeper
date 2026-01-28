@@ -229,12 +229,11 @@ fn getMonotonicMs() i64 {
 ///
 /// 返回：
 ///   - u32: 探测到的真实 IP (如果探测失败则回退至 socket_ip)
-fn extractRealIP(buffer: []const u8, socket_ip: u32) u32 {
+fn extractRealIP(buffer: []const u8, socket_ip: u32) !u32 {
     const index_mod = @import("utils/index.zig");
 
-    // [SECURITY] 仅当连接来自 127.0.0.1 (cloudflared 隧道) 时才信任标头
-    // 防止外部攻击者通过伪造标头绕过限制
-    if (socket_ip != 0x7F000001) return socket_ip;
+    // [SECURITY] 仅当连接来自 127.0.0.1 (cloudflared 隧道) 时才处理标头
+    const is_tunnel = (socket_ip == 0x7F000001);
 
     const cf_header = "cf-connecting-ip: ";
     if (std.mem.indexOf(u8, buffer, cf_header)) |pos| {
@@ -253,7 +252,6 @@ fn extractRealIP(buffer: []const u8, socket_ip: u32) u32 {
         const start = pos + xff_header.len;
         if (std.mem.indexOfScalar(u8, buffer[start..], '\r')) |end_rel| {
             var line = buffer[start .. start + end_rel];
-            // XFF 可能包含逗号分隔的列表，取第一个
             if (std.mem.indexOfScalar(u8, line, ',')) |comma_pos| {
                 line = line[0..comma_pos];
             }
@@ -262,6 +260,9 @@ fn extractRealIP(buffer: []const u8, socket_ip: u32) u32 {
             } else |_| {}
         }
     }
+
+    // [CRITICAL] 如果是隧道连接但没找到有效标头，必须报错拒绝，防止回退到 127.0.0.1 导致 DoS
+    if (is_tunnel) return error.MissingRequiredHeader;
 
     return socket_ip;
 }
@@ -283,12 +284,17 @@ fn handleConnection(allocator: std.mem.Allocator, client_conn: net.Server.Connec
     // 1. 获取 TCP 层原始 IP (内网穿透环境下通常是 127.0.0.1)
     const socket_ip = index_mod.ipFromAddress(client_conn.address) catch 0x7F000001;
 
-    var buffer: [1024]u8 = undefined;
+    // [SECURITY] 增加缓冲区至 16KB，防止攻击者通过超大头部将 IP 字段挤出探测窗口
+    var buffer: [16384]u8 = undefined;
     setSocketTimeout(client_conn.stream.handle, SOCKET_TIMEOUT_MS) catch {};
 
     // 2. 预读数据以提取 Cloudflare 注入的真实访客 IP
     const bytes_read = client_conn.stream.read(&buffer) catch 0;
-    const client_ip = extractRealIP(buffer[0..bytes_read], socket_ip);
+    const client_ip = extractRealIP(buffer[0..bytes_read], socket_ip) catch |err| {
+        // [CRITICAL] 识别失败（如隧道连接缺少标头），立即中断，防止 127.0.0.1 回退 DoS
+        std.debug.print("[SECURITY_EVENT] IP extraction failed: {any}. Force close.\n", .{err});
+        return;
+    };
 
     if (client_ip != socket_ip) {
         std.debug.print("[CF_DETECTED] Real Visitor IP: {d}.{d}.{d}.{d}\n", .{
