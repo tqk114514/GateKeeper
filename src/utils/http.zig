@@ -65,3 +65,18 @@ pub fn parseContentLength(buffer: []const u8) usize {
     }
     return 0;
 }
+
+pub fn isChunked(buffer: []const u8) bool {
+    if (findHeaderValue(buffer, "Transfer-Encoding")) |val| {
+        return std.ascii.indexOfIgnoreCase(val, "chunked") != null;
+    }
+    return false;
+}
+
+pub fn hasSmugglingRisk(buffer: []const u8) bool {
+    // RFC 7230: 如果同时存在 Content-Length 和 Transfer-Encoding，视为走私风险（或需忽略 CL）
+    // 安全网关策略：直接拒绝歧义请求
+    const has_cl = findHeaderValue(buffer, "Content-Length") != null;
+    const has_te = findHeaderValue(buffer, "Transfer-Encoding") != null;
+    return has_cl and has_te;
+}

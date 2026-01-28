@@ -126,7 +126,11 @@ const ProxyContext = struct {
     const HttpState = enum {
         IDLE,
         HEADERS,
-        BODY,
+        BODY, // Content-Length 模式
+        CHUNK_SIZE, // 解析十六进制长度
+        CHUNK_DATA, // 消费 Chunk 数据
+        CHUNK_DATA_CRLF, // Chunk 结尾的 \r\n
+        CHUNK_TRAILERS, // 0-size Chunk 后的 Trailer
     };
 
     /// 内部连接元数据（存放重试次数等）
@@ -139,6 +143,7 @@ const ProxyContext = struct {
         // HTTP 状态机 - 防止 False Positive 和 Smuggling
         http_state: HttpState = .IDLE,
         body_remaining: usize = 0,
+        chunk_remaining: usize = 0, // 当前正在处理的 chunk 剩余大小
     };
 
     pub fn onHeader(ptr: *anyopaque, engine: *reactor.Engine, slot: usize, data: []const u8) anyerror!bool {
@@ -248,6 +253,63 @@ const ProxyContext = struct {
                         meta.http_state = .IDLE; // Body 结束，准备处理下一个请求
                     }
                 },
+                .CHUNK_SIZE => {
+                    const slice = view_data[cursor..];
+                    if (std.mem.indexOf(u8, slice, "\r\n")) |eol_pos| {
+                        const line = slice[0..eol_pos];
+                        var size_str = line;
+                        if (std.mem.indexOfScalar(u8, line, ';')) |semi| {
+                            size_str = line[0..semi];
+                        }
+                        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_str, " "), 16) catch {
+                            return false; // 非法 chunk size
+                        };
+
+                        cursor += eol_pos + 2; // 跳过 size + CRLF
+
+                        if (size == 0) {
+                            meta.http_state = .CHUNK_TRAILERS;
+                        } else {
+                            meta.http_state = .CHUNK_DATA;
+                            meta.chunk_remaining = size;
+                        }
+                    } else {
+                        cursor = total_len; // 等待更多数据
+                    }
+                },
+                .CHUNK_DATA => {
+                    const available = total_len - cursor;
+                    const consume = @min(available, meta.chunk_remaining);
+                    meta.chunk_remaining -= consume;
+                    cursor += consume;
+                    if (meta.chunk_remaining == 0) {
+                        meta.http_state = .CHUNK_DATA_CRLF;
+                    }
+                },
+                .CHUNK_DATA_CRLF => {
+                    if (cursor + 2 <= total_len) {
+                        if (!std.mem.eql(u8, view_data[cursor..][0..2], "\r\n")) return false; // Chunk 必须以 CRLF 结束
+                        cursor += 2;
+                        meta.http_state = .CHUNK_SIZE; // 读下一个 chunk
+                    } else {
+                        cursor = total_len; // 等待更多数据
+                    }
+                },
+                .CHUNK_TRAILERS => {
+                    const slice = view_data[cursor..];
+                    if (std.mem.indexOf(u8, slice, "\r\n")) |eol| {
+                        if (eol == 0) {
+                            // 找到了结束空行
+                            cursor += 2;
+                            meta.http_state = .IDLE;
+                        } else {
+                            // 依然在 Trailer Header 中，跳过这一行
+                            cursor += eol + 2;
+                        }
+                    } else {
+                        cursor = total_len;
+                    }
+                },
                 .IDLE, .HEADERS => {
                     // IDLE/HEADERS 状态下需要扫描 \r\n\r\n
                     // 我们只扫描 view_data[cursor..]
@@ -272,10 +334,21 @@ const ProxyContext = struct {
                     if (std.mem.indexOf(u8, slice, "\r\n\r\n")) |end_pos| {
                         // 找到 Header 结束
                         const header_bytes = slice[0 .. end_pos + 4];
-                        const cl = http_mod.parseContentLength(header_bytes);
 
-                        meta.http_state = .BODY;
-                        meta.body_remaining = cl;
+                        // 防走私检查
+                        if (http_mod.hasSmugglingRisk(header_bytes)) {
+                            // 发现 CL.TE 冲突，直接断开
+                            std.debug.print("[SECURITY] Smuggling attempted IP:{}\n", .{conn.real_ip_cached});
+                            return false;
+                        }
+
+                        if (http_mod.isChunked(header_bytes)) {
+                            meta.http_state = .CHUNK_SIZE;
+                        } else {
+                            const cl = http_mod.parseContentLength(header_bytes);
+                            meta.http_state = .BODY;
+                            meta.body_remaining = cl;
+                        }
 
                         // 移动 cursor 越过 Header
                         cursor += end_pos + 4;
