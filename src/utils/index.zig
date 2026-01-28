@@ -268,8 +268,9 @@ pub fn buildIndex(allocator: mem.Allocator, rules_dir: []const u8, output_path: 
 /// 返回：
 ///   - u32: IP 地址的 32 位整数表示
 pub fn parseIPv4(ip_str: []const u8) !u32 {
+    const trimmed = mem.trim(u8, ip_str, &std.ascii.whitespace);
     var parts: [4]u8 = undefined;
-    var iter = mem.splitScalar(u8, ip_str, '.');
+    var iter = mem.splitScalar(u8, trimmed, '.');
     var i: usize = 0;
 
     while (iter.next()) |part| : (i += 1) {

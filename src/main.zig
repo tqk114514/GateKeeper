@@ -220,6 +220,52 @@ fn getMonotonicMs() i64 {
     return @intCast(@divTrunc(std.time.nanoTimestamp(), std.time.ns_per_ms));
 }
 
+/// extractRealIP 从 HTTP 请求头中提取真实客户端 IP
+/// 专门针对 Cloudflare Tunnel 环境设计
+///
+/// 参数：
+///   - buffer: 包含请求数据的缓冲区
+///   - socket_ip: TCP 层获取的原始 IP
+///
+/// 返回：
+///   - u32: 探测到的真实 IP (如果探测失败则回退至 socket_ip)
+fn extractRealIP(buffer: []const u8, socket_ip: u32) u32 {
+    const index_mod = @import("utils/index.zig");
+
+    // [SECURITY] 仅当连接来自 127.0.0.1 (cloudflared 隧道) 时才信任标头
+    // 防止外部攻击者通过伪造标头绕过限制
+    if (socket_ip != 0x7F000001) return socket_ip;
+
+    const cf_header = "cf-connecting-ip: ";
+    if (std.mem.indexOf(u8, buffer, cf_header)) |pos| {
+        const start = pos + cf_header.len;
+        if (std.mem.indexOfScalar(u8, buffer[start..], '\r')) |end_rel| {
+            const ip_str = buffer[start .. start + end_rel];
+            if (index_mod.parseIPv4(ip_str)) |parsed_ip| {
+                return parsed_ip;
+            } else |_| {}
+        }
+    }
+
+    // 回退方案：寻找标准的 X-Forwarded-For
+    const xff_header = "x-forwarded-for: ";
+    if (std.mem.indexOf(u8, buffer, xff_header)) |pos| {
+        const start = pos + xff_header.len;
+        if (std.mem.indexOfScalar(u8, buffer[start..], '\r')) |end_rel| {
+            var line = buffer[start .. start + end_rel];
+            // XFF 可能包含逗号分隔的列表，取第一个
+            if (std.mem.indexOfScalar(u8, line, ',')) |comma_pos| {
+                line = line[0..comma_pos];
+            }
+            if (index_mod.parseIPv4(line)) |parsed_ip| {
+                return parsed_ip;
+            } else |_| {}
+        }
+    }
+
+    return socket_ip;
+}
+
 /// handleConnection 处理单个客户端连接
 /// 执行 IP 过滤和流量转发逻辑
 fn handleConnection(allocator: std.mem.Allocator, client_conn: net.Server.Connection, ip_index: *@import("utils/index.zig").IndexReader, rate_limiter: *@import("utils/ratelimit.zig").RateLimiter) void {
@@ -234,21 +280,27 @@ fn handleConnection(allocator: std.mem.Allocator, client_conn: net.Server.Connec
 
     const index_mod = @import("utils/index.zig");
 
-    const client_ip = index_mod.ipFromAddress(client_conn.address) catch {
-        std.debug.print("[ERROR] Failed to extract client IP\n", .{});
-        return;
-    };
-
-    const is_blocked = ip_index.isBlocked(client_ip) catch false;
+    // 1. 获取 TCP 层原始 IP (内网穿透环境下通常是 127.0.0.1)
+    const socket_ip = index_mod.ipFromAddress(client_conn.address) catch 0x7F000001;
 
     var buffer: [1024]u8 = undefined;
+    setSocketTimeout(client_conn.stream.handle, SOCKET_TIMEOUT_MS) catch {};
 
-    setSocketTimeout(client_conn.stream.handle, SOCKET_TIMEOUT_MS) catch |err| {
-        std.debug.print("[WARN] Failed to set client timeout: {any}\n", .{err});
-    };
-
+    // 2. 预读数据以提取 Cloudflare 注入的真实访客 IP
     const bytes_read = client_conn.stream.read(&buffer) catch 0;
+    const client_ip = extractRealIP(buffer[0..bytes_read], socket_ip);
 
+    if (client_ip != socket_ip) {
+        std.debug.print("[CF_DETECTED] Real Visitor IP: {d}.{d}.{d}.{d}\n", .{
+            (client_ip >> 24) & 0xFF,
+            (client_ip >> 16) & 0xFF,
+            (client_ip >> 8) & 0xFF,
+            client_ip & 0xFF,
+        });
+    }
+
+    // 3. 执行黑名单检查
+    const is_blocked = ip_index.isBlocked(client_ip) catch false;
     if (is_blocked) {
         std.debug.print("[BLOCK] IP blocked: {d}.{d}.{d}.{d}\n", .{
             (client_ip >> 24) & 0xFF,
@@ -256,11 +308,11 @@ fn handleConnection(allocator: std.mem.Allocator, client_conn: net.Server.Connec
             (client_ip >> 8) & 0xFF,
             client_ip & 0xFF,
         });
-
         sendBlockedResponse(client_conn.stream, client_ip, "HTTP/1.1 200 OK\r\n") catch {};
         return;
     }
 
+    // 4. 执行速率限制检查
     const rate_ok = rate_limiter.checkLimit(client_ip) catch false;
     if (!rate_ok) {
         std.debug.print("[RATE_LIMIT] IP exceeded rate limit: {d}.{d}.{d}.{d}\n", .{
@@ -269,7 +321,6 @@ fn handleConnection(allocator: std.mem.Allocator, client_conn: net.Server.Connec
             (client_ip >> 8) & 0xFF,
             client_ip & 0xFF,
         });
-
         sendBlockedResponse(client_conn.stream, client_ip, "HTTP/1.1 429 Too Many Requests\r\n") catch {};
         return;
     }
