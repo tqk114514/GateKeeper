@@ -15,6 +15,40 @@ const TARGET_PORT = 3000;
 const MAX_CONNECTIONS = 10000;
 const BUFFER_SIZE = 16 * 1024;
 
+const TrustedSubnet = struct {
+    ip: u32,
+    mask: u32,
+};
+
+// CIDR 白名单：只信任这些 IP 发来的 X-Forwarded-For / CF-Connecting-IP
+// 默认仅信任本机回环 (127.0.0.0/8)
+const TRUSTED_PROXIES = [_]TrustedSubnet{
+    .{ .ip = 0x7F000000, .mask = 0xFF000000 },
+};
+
+fn isTrustedProxy(ip: u32) bool {
+    // ip 是主机字节序
+    for (TRUSTED_PROXIES) |subnet| {
+        if ((ip & subnet.mask) == (subnet.ip & subnet.mask)) return true;
+    }
+    return false;
+}
+
+fn sendErrorResponse(fd: posix.socket_t, code: []const u8, reason: []const u8, body: []const u8) !void {
+    const header =
+        "HTTP/1.1 {s} {s}\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "\r\n";
+
+    var buf: [512]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&buf, header, .{ code, reason, body.len });
+
+    _ = try posix.write(fd, msg);
+    _ = try posix.write(fd, body);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -111,7 +145,28 @@ const ProxyContext = struct {
         const self: *ProxyContext = @ptrCast(@alignCast(ptr));
         const conn = &engine.conn_pool[slot].?;
 
-        // 1. 获取客户端 IP
+        // 0. Lazy Init Context (if not exists)
+        if (conn.context == null) {
+            const meta = try engine.allocator.create(ConnMeta);
+            meta.* = .{};
+            conn.context = meta;
+        }
+
+        // 1. 累积 Header 数据 (利用 s2c_buf 作为临时存储，最大 16KB)
+        // 防止 Header 被切分导致 extractRealIP 找不到关键字
+        if (conn.s2c_len + data.len > conn.s2c_buf.len) return false; // Header Too Large
+        @memcpy(conn.s2c_buf[conn.s2c_len..][0..data.len], data);
+        conn.s2c_len += data.len;
+
+        const full_header = conn.s2c_buf[0..conn.s2c_len];
+
+        // 2. 检查 Header 是否完整
+        if (std.mem.indexOf(u8, full_header, "\r\n\r\n") == null) {
+            // 不完整，继续等待更多数据
+            return true;
+        }
+
+        // 3. 获取客户端 IP & 提取真实 IP
         const socket_ip = blk: {
             var peer_storage: posix.sockaddr.storage = undefined;
             var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
@@ -120,21 +175,27 @@ const ProxyContext = struct {
             break :blk @byteSwap(peer_net_addr.in.sa.addr);
         };
 
-        const real_ip = try extractRealIP(data, socket_ip);
+        const real_ip = try extractRealIP(full_header, socket_ip);
         conn.real_ip_cached = real_ip;
 
-        // 2. 安全检查
+        // 4. 安全检查
         if (try self.ip_index.isBlocked(real_ip)) return false;
         if (!(try self.rate_limiter.checkLimit(real_ip))) return false;
 
-        // 3. 健康检查
+        // 5. 健康检查
         if (self.consecutive_failures >= HEALTH_THRESHOLD) {
             if (reactor.getMonotonicMs() - self.last_failure_time < COOLING_PERIOD_MS) {
                 return false;
             }
         }
 
-        // 4. 发起后端连接
+        // 6. 恢复 c2s_buf 用于转发 (将完整的 Header 放回 c2s_buf)
+        // reactor 在 PUMPING 状态下会发送 c2s_buf 内容
+        @memcpy(conn.c2s_buf[0..full_header.len], full_header);
+        conn.c2s_len = full_header.len;
+        conn.s2c_len = 0; // 清空临时累积区
+
+        // 7. 发起后端连接
         return try self.connectToBackend(engine, slot);
     }
 
@@ -271,8 +332,7 @@ const ProxyContext = struct {
             _ = try self.connectToBackend(engine, slot);
         } else {
             // 发送 502 并标记关闭
-            const msg = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nGatekeeper: Backend Unreachable after retries.";
-            _ = posix.write(conn.client_fd, msg) catch {};
+            sendErrorResponse(conn.client_fd, "502", "Bad Gateway", "Gatekeeper: Backend Unreachable after retries.") catch {};
             conn.state = .CLOSING;
             engine.allocator.destroy(meta);
             conn.context = null;
@@ -289,8 +349,8 @@ fn cleanupTask(rate_limiter: *@import("utils/ratelimit.zig").RateLimiter) void {
 
 fn extractRealIP(buffer: []const u8, socket_ip: u32) !u32 {
     const index_mod = @import("utils/index.zig");
-    // 仅在来自本地回环（如 Nginx/Cloudflare Tunnel 转发）时尝试提取真实 IP
-    if (socket_ip != 0x7F000001) return socket_ip;
+    // 仅在来自可信代理（如 Nginx/Cloudflare Tunnel 转发）时尝试提取真实 IP
+    if (!isTrustedProxy(socket_ip)) return socket_ip;
 
     // 2. 使用安全解析器提取 IP
     const http_mod = @import("utils/http.zig");
