@@ -159,7 +159,19 @@ pub const RateLimiter = struct {
 
         const record = shard.map.get(ip);
 
+        const MAX_IPS_PER_SHARD = 10000;
+
         if (record == null) {
+            // 内存熔断保护：如果当前 Shard 追踪 IP 数过多，触发紧急清理
+            if (shard.map.count() >= MAX_IPS_PER_SHARD) {
+                // 简单策略：拒绝新 IP 追踪（相当于放行，因为没有记录历史），或者更激进地由 cleanupTask 负责
+                // 这里选择激进清空：为了防止 OOM，丢弃当前 Shard 所有记录
+                // 虽然会重置该 Shard 下所有 IP 的限制，但保命优先
+                var iter = shard.map.valueIterator();
+                while (iter.next()) |rec| rec.deinit();
+                shard.map.clearRetainingCapacity();
+            }
+
             var new_record = IPRecord.init(self.allocator);
             try new_record.timestamps.append(self.allocator, now);
             try shard.map.put(ip, new_record);

@@ -226,7 +226,9 @@ pub const Engine = struct {
                 const meta = self.poll_meta[i];
                 var keep = true;
                 if (revents != 0) keep = self.handleEvent(i, revents) catch false;
-                if (keep and getMonotonicMs() - self.conn_pool[meta.slot_index].?.last_activity > 300_000) keep = false;
+                var timeout_ms: i64 = 30_000;
+                if (self.conn_pool[meta.slot_index].?.state == .HEADER_PENDING) timeout_ms = 5_000;
+                if (keep and getMonotonicMs() - self.conn_pool[meta.slot_index].?.last_activity > timeout_ms) keep = false;
                 if (!keep) {
                     self.removeFDsForSlot(meta.slot_index);
                     i = 1;
@@ -244,7 +246,10 @@ pub const Engine = struct {
         while (i < self.poll_count) {
             const meta = self.poll_meta[i];
             const conn = &self.conn_pool[meta.slot_index].?;
-            if (now - conn.last_activity > 300_000) {
+            var timeout_ms: i64 = 30_000;
+            if (conn.state == .HEADER_PENDING) timeout_ms = 5_000; // Slowloris mitigation
+
+            if (now - conn.last_activity > timeout_ms) {
                 self.removeFDsForSlot(meta.slot_index);
                 i = 1;
             } else {
