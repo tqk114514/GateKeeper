@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access Denied</title>
+    <style>
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000000;
+            color: #ffffff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        h1 {
+            font-size: 3em;
+            margin-bottom: 10px;
+        }
+
+        .ip-info {
+            font-size: 0.9em;
+            opacity: 0.6;
+            margin-top: 5px;
+            font-family: 'Courier New', monospace;
+        }
+
+        footer {
+            position: absolute;
+            bottom: 20px;
+            font-size: 0.7em;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+
+<body>
+    <h1 id="message">Oops...您的访问已被禁止</h1>
+    <div class="ip-info">Your IP: {{CLIENT_IP}}</div>
+    <footer id="copyright"></footer>
+    <script>
+        const messages = {
+            'zh-CN': 'Oops...您的访问已被禁止',
+            'zh-TW': 'Oops...您的訪問已被禁止',
+            'en': 'Oops...Your access has been denied',
+            'ja': 'Oops...アクセスが拒否されました',
+            'ko': 'Oops...액세스가 거부되었습니다'
+        };
+
+        const copyrightTexts = {
+            'zh-CN': '版权所有',
+            'zh-TW': '版權所有',
+            'en': 'All Rights Reserved',
+            'ja': '無断転載禁止',
+            'ko': '모든 권리 보유'
+        };
+
+        function getCookie(name) {
+            const value = `; ${document.cookie}`;
+            const parts = value.split(`; ${name}=`);
+            if (parts.length === 2) return parts.pop().split(';').shift();
+            return null;
+        }
+
+        const lang = getCookie('selectedLanguage') || 'zh-CN';
+        const currentYear = new Date().getFullYear();
+
+        document.getElementById('message').textContent = messages[lang] || messages['zh-CN'];
+        document.getElementById('copyright').textContent = `© ${currentYear} Nebula Studios ${copyrightTexts[lang] || copyrightTexts['zh-CN']}`;
+        document.documentElement.lang = lang;
+    </script>
+</body>
+
+</html>
