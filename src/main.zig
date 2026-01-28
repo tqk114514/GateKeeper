@@ -7,6 +7,7 @@ const mem = std.mem;
 const posix = std.posix;
 const Thread = std.Thread;
 const reactor = @import("reactor/mod.zig");
+const http_state = @import("utils/http_state.zig");
 
 // ====================  常量定义 ====================
 const LOCAL_PORT = 3001;
@@ -42,14 +43,24 @@ fn sendErrorResponse(conn: *reactor.Connection, code: []const u8, reason: []cons
         "Content-Length: {d}\r\n" ++
         "\r\n";
 
-    var buf: [512]u8 = undefined;
-    const msg = try std.fmt.bufPrint(&buf, header, .{ code, reason, body.len });
+    var buf: [1024]u8 = undefined;
+    var final_msg: []const u8 = undefined;
+    var final_body: []const u8 = undefined;
+
+    if (std.fmt.bufPrint(&buf, header, .{ code, reason, body.len })) |formatted| {
+        final_msg = formatted;
+        final_body = body;
+    } else |_| {
+        // Fallback if formatting fails (e.g. overflow)
+        final_msg = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 21\r\n\r\nInternal Server Error";
+        final_body = "";
+    }
 
     // 尝试直接发送
     var total_sent: usize = 0;
     const iov = [_]posix.iovec_const{
-        .{ .base = msg.ptr, .len = msg.len },
-        .{ .base = body.ptr, .len = body.len },
+        .{ .base = final_msg.ptr, .len = final_msg.len },
+        .{ .base = final_body.ptr, .len = final_body.len },
     };
 
     // 使用 writev 尝试一次性发送 header + body
@@ -59,7 +70,7 @@ fn sendErrorResponse(conn: *reactor.Connection, code: []const u8, reason: []cons
         if (err != error.WouldBlock) return err;
     }
 
-    const total_len = msg.len + body.len;
+    const total_len = final_msg.len + final_body.len;
     if (total_sent < total_len) {
         // 发送不完整，需要缓冲剩余部分并进入 FLUSHING 状态
         // 我们利用 s2c_buf 作为缓冲 (假设此时没有正常的后端转发数据)
@@ -70,8 +81,8 @@ fn sendErrorResponse(conn: *reactor.Connection, code: []const u8, reason: []cons
         var offset: usize = 0;
 
         // 填充 msg 剩余部分
-        if (total_sent < msg.len) {
-            const part = msg[total_sent..];
+        if (total_sent < final_msg.len) {
+            const part = final_msg[total_sent..];
             @memcpy(conn.s2c_buf[offset..][0..part.len], part);
             offset += part.len;
             remaining -= part.len;
@@ -79,8 +90,8 @@ fn sendErrorResponse(conn: *reactor.Connection, code: []const u8, reason: []cons
 
         // 填充 body 剩余部分
         if (remaining > 0) {
-            const body_sent = if (total_sent > msg.len) total_sent - msg.len else 0;
-            const part = body[body_sent..];
+            const body_sent = if (total_sent > final_msg.len) total_sent - final_msg.len else 0;
+            const part = final_body[body_sent..];
             @memcpy(conn.s2c_buf[offset..][0..part.len], part);
             offset += part.len;
         }
@@ -168,88 +179,123 @@ const ProxyContext = struct {
     const HEALTH_THRESHOLD = 5;
     const COOLING_PERIOD_MS = 10000;
 
-    const HttpState = enum {
-        IDLE,
-        HEADERS,
-        BODY, // Content-Length 模式
-        CHUNK_SIZE, // 解析十六进制长度
-        CHUNK_DATA, // 消费 Chunk 数据
-        CHUNK_DATA_CRLF, // Chunk 结尾的 \r\n
-        CHUNK_TRAILERS, // 0-size Chunk 后的 Trailer
-    };
-
-    /// 内部连接元数据（存放重试次数等）
     const ConnMeta = struct {
         retries: u8 = 0,
-        // TCP 分片重组缓冲区 (最大方法长度 "OPTIONS " = 8)
-        frag_buf: [8]u8 = undefined,
-        frag_len: usize = 0,
-
-        // HTTP 状态机 - 防止 False Positive 和 Smuggling
-        http_state: HttpState = .IDLE,
-        body_remaining: usize = 0,
-        chunk_remaining: usize = 0, // 当前正在处理的 chunk 剩余大小
-        total_read: usize = 0, // 累计流量 (for Slowloris check)
+        sm: http_state.StateMachine,
+        total_read: usize = 0,
     };
 
     pub fn onHeader(ptr: *anyopaque, engine: *reactor.Engine, slot: usize, data: []const u8) anyerror!bool {
         const self: *ProxyContext = @ptrCast(@alignCast(ptr));
         const conn = &engine.conn_pool[slot].?;
 
-        // 0. Lazy Init Context (if not exists)
+        // 懒加载 Context
         if (conn.context == null) {
             const meta = try engine.allocator.create(ConnMeta);
-            meta.* = .{};
+            meta.* = .{
+                .retries = 0,
+                .sm = http_state.StateMachine.init(),
+            };
             conn.context = meta;
         }
         var meta: *ConnMeta = @ptrCast(@alignCast(conn.context.?));
         meta.total_read += data.len;
 
-        // 1. 累积 Header 数据 (利用 s2c_buf 作为临时存储，最大 16KB)
-        // 防止 Header 被切分导致 extractRealIP 找不到关键字
+        // 1. Accumulate Header data (using s2c_buf as temporary storage, max 16KB)
+        // Prevent Header truncation causing extractRealIP to miss keywords
         if (conn.s2c_len + data.len > conn.s2c_buf.len) return false; // Header Too Large
+
         @memcpy(conn.s2c_buf[conn.s2c_len..][0..data.len], data);
         conn.s2c_len += data.len;
 
-        const full_header = conn.s2c_buf[0..conn.s2c_len];
+        const combined_header = conn.s2c_buf[0..conn.s2c_len];
 
-        // 2. 检查 Header 是否完整
-        if (std.mem.indexOf(u8, full_header, "\r\n\r\n") == null) {
-            // 不完整，继续等待更多数据
-            return true;
-        }
+        // 2. Check strict HTTP header completeness
+        // Robustness: Support both CRLF (\r\n\r\n) and LF (\n\n) terminators
+        var header_end_len: usize = 0;
+        const end_pos_opt = blk: {
+            const p1 = mem.indexOf(u8, combined_header, "\r\n\r\n");
+            const p2 = mem.indexOf(u8, combined_header, "\n\n");
+            if (p1) |pos1| {
+                if (p2) |pos2| {
+                    if (pos1 < pos2) {
+                        header_end_len = 4;
+                        break :blk pos1;
+                    } else {
+                        header_end_len = 2;
+                        break :blk pos2;
+                    }
+                }
+                header_end_len = 4;
+                break :blk p1;
+            }
+            if (p2) |pos2| {
+                header_end_len = 2;
+                break :blk pos2;
+            }
+            break :blk null;
+        };
 
-        // 3. 获取客户端 IP & 提取真实 IP
-        const socket_ip = blk: {
+        if (end_pos_opt) |end_pos| {
+            // Header complete
+            // Initial Security Checks
             var peer_storage: posix.sockaddr.storage = undefined;
             var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
             try posix.getpeername(conn.client_fd, @ptrCast(&peer_storage), &peer_len);
             const peer_net_addr = net.Address.initPosix(@ptrCast(&peer_storage));
-            break :blk @byteSwap(peer_net_addr.in.sa.addr);
-        };
+            const socket_ip = @byteSwap(peer_net_addr.in.sa.addr);
+            conn.real_ip_cached = try extractRealIP(combined_header, socket_ip);
 
-        const real_ip = try extractRealIP(full_header, socket_ip);
-        conn.real_ip_cached = real_ip;
+            // Smuggling Checks (Duplicate Headers, CL.TE)
+            const http_mod = @import("utils/http.zig");
+            http_mod.validateHeaderSection(combined_header[0 .. end_pos + header_end_len]) catch return false;
 
-        // 4. 安全检查
-        if (try self.ip_index.isBlocked(real_ip)) return false;
-        if (!(try self.rate_limiter.checkLimit(real_ip))) return false;
-
-        // 5. 健康检查
-        if (self.consecutive_failures >= HEALTH_THRESHOLD) {
-            if (reactor.getMonotonicMs() - self.last_failure_time < COOLING_PERIOD_MS) {
+            if (http_mod.hasSmugglingRisk(combined_header[0 .. end_pos + header_end_len])) {
+                std.debug.print("[SECURITY] HTTP Smuggling Risk Detected IP:{}\n", .{conn.real_ip_cached});
                 return false;
             }
+
+            // Header 收齐了，进行一次性的 SM 校验来确保合法性（同步状态机与 Header）
+            // Reset SM
+            meta.sm.reset();
+            var event: http_state.Event = .CONTINUE;
+            for (combined_header) |b| {
+                if (!(try meta.sm.feed(b, &event))) {
+                    std.debug.print("[SECURITY] Invalid Header Byte in SM check IP:{}\n", .{conn.real_ip_cached});
+                    return false;
+                }
+                // Header 阶段不应该 FINISHED（除非 GET 没有 Body）
+            }
+            // 此时 SM 应该处于 BODY 状态或 READY for next
+
+            // 安全检查：Rate Limit
+            if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) return false;
+
+            // 5. 健康检查
+            if (self.consecutive_failures >= HEALTH_THRESHOLD) {
+                if (reactor.getMonotonicMs() - self.last_failure_time < COOLING_PERIOD_MS) {
+                    return false;
+                }
+            }
+
+            // 准备连接后端
+            conn.state = .BACKEND_CONNECTING;
+            // Reactor logic: client_fd -> c2s_buf.
+            // We need to move combined_header back to c2s_buf?
+            // Actually `BACKEND_CONNECTING` logic usually doesn't send data yet.
+            // Once connected (.PUMPING), proper proxying starts using whatever is in c2s_buf?
+            // NO. The `onHeader` accumulates. We need to send this accumulation to Backend.
+            // We should Copy valid header to c2s_buf and set c2s_len.
+
+            @memcpy(conn.c2s_buf[0..conn.s2c_len], combined_header);
+            conn.c2s_len = conn.s2c_len;
+            conn.s2c_len = 0; // Clear temp use
+
+            _ = try self.connectToBackend(engine, slot);
+            return true;
         }
 
-        // 6. 恢复 c2s_buf 用于转发 (将完整的 Header 放回 c2s_buf)
-        // reactor 在 PUMPING 状态下会发送 c2s_buf 内容
-        @memcpy(conn.c2s_buf[0..full_header.len], full_header);
-        conn.c2s_len = full_header.len;
-        conn.s2c_len = 0; // 清空临时累积区
-
-        // 7. 发起后端连接
-        return try self.connectToBackend(engine, slot);
+        return true;
     }
 
     fn connectToBackend(self: *ProxyContext, engine: *reactor.Engine, slot: usize) !bool {
@@ -275,153 +321,24 @@ const ProxyContext = struct {
         var meta: *ConnMeta = @ptrCast(@alignCast(conn.context.?));
         meta.total_read += data.len;
 
-        // 1. 构造跨包视图：[上一包尾部] + [当前包]
-        // 使用非常小的栈上缓冲，避免动态分配
-        var combined_buf: [16 * 1024 + 8]u8 = undefined;
-        // 安全检查：防止栈溢出 (虽然 reactor 限制了 read buffer size)
-        if (meta.frag_len + data.len > combined_buf.len) return false;
+        var event: http_state.Event = .CONTINUE;
 
-        @memcpy(combined_buf[0..meta.frag_len], meta.frag_buf[0..meta.frag_len]);
-        @memcpy(combined_buf[meta.frag_len .. meta.frag_len + data.len], data);
-
-        const view_data = combined_buf[0 .. meta.frag_len + data.len];
-
-        // 2. HTTP 状态机流式处理
-        const http_mod = @import("utils/http.zig");
-        var cursor: usize = 0;
-        const total_len = meta.frag_len + data.len;
-
-        while (cursor < total_len) {
-            switch (meta.http_state) {
-                .BODY => {
-                    const available = total_len - cursor;
-                    const consume = @min(available, meta.body_remaining);
-                    meta.body_remaining -= consume;
-                    cursor += consume;
-                    if (meta.body_remaining == 0) {
-                        meta.http_state = .IDLE; // Body 结束，准备处理下一个请求
-                    }
-                },
-                .CHUNK_SIZE => {
-                    const slice = view_data[cursor..];
-                    if (std.mem.indexOf(u8, slice, "\r\n")) |eol_pos| {
-                        const line = slice[0..eol_pos];
-                        var size_str = line;
-                        if (std.mem.indexOfScalar(u8, line, ';')) |semi| {
-                            size_str = line[0..semi];
-                        }
-                        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_str, " "), 16) catch {
-                            return false; // 非法 chunk size
-                        };
-
-                        cursor += eol_pos + 2; // 跳过 size + CRLF
-
-                        if (size == 0) {
-                            meta.http_state = .CHUNK_TRAILERS;
-                        } else {
-                            meta.http_state = .CHUNK_DATA;
-                            meta.chunk_remaining = size;
-                        }
-                    } else {
-                        cursor = total_len; // 等待更多数据
-                    }
-                },
-                .CHUNK_DATA => {
-                    const available = total_len - cursor;
-                    const consume = @min(available, meta.chunk_remaining);
-                    meta.chunk_remaining -= consume;
-                    cursor += consume;
-                    if (meta.chunk_remaining == 0) {
-                        meta.http_state = .CHUNK_DATA_CRLF;
-                    }
-                },
-                .CHUNK_DATA_CRLF => {
-                    if (cursor + 2 <= total_len) {
-                        if (!std.mem.eql(u8, view_data[cursor..][0..2], "\r\n")) return false; // Chunk 必须以 CRLF 结束
-                        cursor += 2;
-                        meta.http_state = .CHUNK_SIZE; // 读下一个 chunk
-                    } else {
-                        cursor = total_len; // 等待更多数据
-                    }
-                },
-                .CHUNK_TRAILERS => {
-                    const slice = view_data[cursor..];
-                    if (std.mem.indexOf(u8, slice, "\r\n")) |eol| {
-                        if (eol == 0) {
-                            // 找到了结束空行
-                            cursor += 2;
-                            meta.http_state = .IDLE;
-                        } else {
-                            // 依然在 Trailer Header 中，跳过这一行
-                            cursor += eol + 2;
-                        }
-                    } else {
-                        cursor = total_len;
-                    }
-                },
-                .IDLE, .HEADERS => {
-                    // IDLE/HEADERS 状态下需要扫描 \r\n\r\n
-                    // 我们只扫描 view_data[cursor..]
-                    const slice = view_data[cursor..];
-
-                    // 1. 如果还在 IDLE，探测 Method
-                    if (meta.http_state == .IDLE) {
-                        const methods = [_][]const u8{ "GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "PATCH " };
-                        for (methods) |m| {
-                            if (std.mem.startsWith(u8, slice, m)) {
-                                if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) return false;
-                                meta.http_state = .HEADERS;
-                                break;
-                            }
-                        }
-                        // 如果是 IDLE 但开头不是 Method，可能是 Pipeline 中的 \r\n 残留，也可能是非法数据
-                        // 简单起见，我们默认切到 HEADERS 模式寻找结尾，或者继续等待
-                        if (meta.http_state == .IDLE) meta.http_state = .HEADERS;
-                    }
-
-                    // 2. 寻找 Header 结束符
-                    if (std.mem.indexOf(u8, slice, "\r\n\r\n")) |end_pos| {
-                        // 找到 Header 结束
-                        const header_bytes = slice[0 .. end_pos + 4];
-
-                        // 严格 Header 合法性校验 (Obs-fold, Duplicate Headers)
-                        http_mod.validateHeaderSection(header_bytes) catch |err| {
-                            std.debug.print("[SECURITY] Invalid Header: {} IP:{}\n", .{ err, conn.real_ip_cached });
-                            return false;
-                        };
-
-                        if (http_mod.isChunked(header_bytes)) {
-                            meta.http_state = .CHUNK_SIZE;
-                        } else {
-                            const cl = http_mod.parseContentLength(header_bytes);
-                            meta.http_state = .BODY;
-                            meta.body_remaining = cl;
-                        }
-
-                        // 移动 cursor 越过 Header
-                        cursor += end_pos + 4;
-                    } else {
-                        // 没找到 Header 结束符，说明 Header 跨包了
-                        // 这一整块数据都是 Header 的一部分
-                        cursor = total_len; // 消耗完
-                    }
-                },
+        // Anti-Smuggling: Feed every byte to Strict State Machine
+        for (data) |b| {
+            // 如果 SM 发现协议错误 (e.g. Chunk Size 非法，Smuggling 迹象)，直接断开
+            if (!(try meta.sm.feed(b, &event))) {
+                std.debug.print("[SECURITY] Smuggling Detected: Invalid Byte sequence IP:{}\n", .{conn.real_ip_cached});
+                return false;
             }
-        }
 
-        // 3. 更新尾部缓冲 (滚动追加模式)
-        if (data.len >= 8) {
-            @memcpy(meta.frag_buf[0..8], data[data.len - 8 ..]);
-            meta.frag_len = 8;
-        } else {
-            const space_needed = 8 - data.len;
-            const keep_existing = @min(meta.frag_len, space_needed);
-
-            if (keep_existing > 0) {
-                std.mem.copyForwards(u8, meta.frag_buf[0..keep_existing], meta.frag_buf[meta.frag_len - keep_existing .. meta.frag_len]);
+            if (event == .REQUEST_FINISHED) {
+                // 当前请求结束，SM 自动重置为 IDLE，准备接受 Pipeline 的下一个请求
+                // 必须对下一个请求进行限流检查
+                if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) {
+                    std.debug.print("[SECURITY] Rate Limit Triggered on Pipeline Request IP:{}\n", .{conn.real_ip_cached});
+                    return false;
+                }
             }
-            @memcpy(meta.frag_buf[keep_existing .. keep_existing + data.len], data);
-            meta.frag_len = keep_existing + data.len;
         }
 
         return true;
@@ -437,7 +354,11 @@ const ProxyContext = struct {
         // 懒加载 Context
         if (conn.context == null) {
             const meta = try engine.allocator.create(ConnMeta);
-            meta.* = .{ .retries = 0 };
+            meta.* = .{
+                .retries = 0,
+                .sm = http_state.StateMachine.init(),
+                // total_read defaults to 0
+            };
             conn.context = meta;
         }
         var meta: *ConnMeta = @ptrCast(@alignCast(conn.context.?));
