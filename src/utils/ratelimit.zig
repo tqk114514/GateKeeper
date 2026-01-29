@@ -164,11 +164,26 @@ pub const RateLimiter = struct {
         if (record == null) {
             // 内存熔断保护：如果当前 Shard 追踪 IP 数过多，触发紧急清理
             if (shard.map.count() >= MAX_IPS_PER_SHARD) {
-                // Fail Closed 策略：
-                // 当分片已满且没有过期条目被 cleanupTask 清理掉时，说明遭受了持续的高强度攻击。
-                // 此时拒绝追踪新 IP（直接视为被限流/拒绝服务）是保护系统内存和现有限流状态的唯一安全手段。
-                // 绝对不能清空 Map，否则攻击者会利用它重置自己的计数器。
-                return false;
+                // Fail-Safe / Anti-DoS 策略：LRU 淘汰
+                // 当分片已满，不再拒绝新连接，而是牺牲最久未活跃的用户。
+                // 这防止了攻击者简单地填满哈希表来拒绝合法用户服务。
+
+                var oldest_ip: u32 = 0;
+                var min_access: i64 = std.math.maxInt(i64);
+
+                var iter = shard.map.iterator();
+                while (iter.next()) |entry| {
+                    if (entry.value_ptr.last_access < min_access) {
+                        min_access = entry.value_ptr.last_access;
+                        oldest_ip = entry.key_ptr.*;
+                    }
+                }
+
+                // 驱逐最老的条目
+                if (shard.map.fetchRemove(oldest_ip)) |kv| {
+                    var old_rec = kv.value;
+                    old_rec.deinit();
+                }
             }
 
             var new_record = IPRecord.init(self.allocator);

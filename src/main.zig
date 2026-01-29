@@ -145,6 +145,7 @@ pub fn main() !void {
             .onPumping = ProxyContext.onPumping,
             .onBackendError = ProxyContext.onBackendError,
             .onKeepAlive = ProxyContext.onKeepAlive,
+            .onCleanup = ProxyContext.onCleanup,
         },
     );
     defer engine.deinit();
@@ -378,6 +379,19 @@ const ProxyContext = struct {
             // 注意：不要在这里强制设置 CLOSING，因为 sendErrorResponse 可能置为 FLUSHING
             engine.allocator.destroy(meta);
             conn.context = null;
+        }
+    }
+
+    pub fn onCleanup(ptr: *anyopaque, engine: *reactor.Engine, slot: usize) void {
+        const self: *ProxyContext = @ptrCast(@alignCast(ptr));
+        _ = self;
+        if (engine.conn_pool[slot]) |*conn| {
+            if (conn.context) |ctx| {
+                const meta: *ConnMeta = @ptrCast(@alignCast(ctx));
+                // Anti-Leak: Ensure ConnMeta is freed when connection is destroyed (even if onBackendError didn't catch it)
+                engine.allocator.destroy(meta);
+                conn.context = null;
+            }
         }
     }
 

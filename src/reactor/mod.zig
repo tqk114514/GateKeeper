@@ -74,6 +74,8 @@ pub const EventHandler = struct {
     onBackendError: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize) anyerror!void,
     // 定期检查连接是否健康 (Slowloris 防御 hook)
     onKeepAlive: *const fn (ctx: *anyopaque, engine: *Engine, slot: usize) anyerror!bool,
+    // [New] 连接销毁时的清理回调 (防止内存泄漏)
+    onCleanup: ?*const fn (ctx: *anyopaque, engine: *Engine, slot: usize) void = null,
 };
 
 /// Engine 反应器引擎
@@ -187,19 +189,32 @@ pub const Engine = struct {
     }
 
     pub fn removeFDsForSlot(self: *Engine, slot: usize) void {
+        // [Lifecycle] 1. Notify Application to Clean Up User Context
+        if (self.handler.onCleanup) |cleanup| {
+            cleanup(self.handler.ptr, self, slot);
+        }
+
+        // [Lifecycle] 2. Remove associated FDs from Poller
         var i: usize = 1;
         while (i < self.poll_count) {
             if (self.poll_meta[i].slot_index == slot) {
                 const fd = self.poll_meta[i].fd;
                 if (comptime is_linux) posix.epoll_ctl(self.backend_fd, posix.system.EPOLL.CTL_DEL, fd, null) catch {};
-                if (i < self.poll_count - 1) {
-                    const last_idx = self.poll_count - 1;
-                    self.poll_meta[i] = self.poll_meta[last_idx];
-                    if (comptime !is_linux) self.poll_fds[i] = self.poll_fds[last_idx];
+
+                // Swap with last element to remove in O(1)
+                const last = self.poll_count - 1;
+                if (i < last) {
+                    self.poll_meta[i] = self.poll_meta[last];
+                    if (comptime !is_linux) self.poll_fds[i] = self.poll_fds[last];
+                    // Do not increment i, check the swapped-in element next loop
                 }
                 self.poll_count -= 1;
-            } else i += 1;
+            } else {
+                i += 1;
+            }
         }
+
+        // [Lifecycle] 3. Close Socket and Free Slot
         if (self.conn_pool[slot]) |*c| c.close();
         self.conn_pool[slot] = null;
     }
