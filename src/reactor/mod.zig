@@ -324,7 +324,7 @@ pub const Engine = struct {
 
         switch (conn.state) {
             .HEADER_PENDING => if (revents & posix.POLL.IN != 0) {
-                const n = try posix.read(conn.client_fd, &conn.c2s_buf);
+                const n = try posix.recv(conn.client_fd, &conn.c2s_buf, 0);
                 if (n == 0) return false;
                 conn.c2s_len = n;
                 conn.last_activity = getMonotonicMs();
@@ -346,7 +346,7 @@ pub const Engine = struct {
                 if (revents & posix.POLL.IN != 0) {
                     const buf = if (kind == .client) &conn.c2s_buf else &conn.s2c_buf;
                     const len = if (kind == .client) &conn.c2s_len else &conn.s2c_len;
-                    const n = posix.read(src_fd, buf[len.*..]) catch 0;
+                    const n = posix.recv(src_fd, buf[len.*..], 0) catch 0;
                     if (n == 0) return false;
                     if (n > 0) {
                         if (kind == .client) {
@@ -361,7 +361,7 @@ pub const Engine = struct {
                     const buf = if (kind == .client) &conn.s2c_buf else &conn.c2s_buf;
                     const len = if (kind == .client) &conn.s2c_len else &conn.c2s_len;
                     const sent = if (kind == .client) &conn.s2c_sent else &conn.c2s_sent;
-                    const n = posix.write(src_fd, buf[sent.*..len.*]) catch 0;
+                    const n = posix.send(src_fd, buf[sent.*..len.*], 0) catch 0;
                     if (n > 0) {
                         sent.* += n;
                         conn.last_activity = getMonotonicMs();
@@ -379,7 +379,7 @@ pub const Engine = struct {
                     const len = conn.s2c_len;
                     const sent = &conn.s2c_sent;
 
-                    const n = posix.write(conn.client_fd, buf[sent.*..len]) catch 0;
+                    const n = posix.send(conn.client_fd, buf[sent.*..len], 0) catch 0;
                     if (n > 0) {
                         sent.* += n;
                         conn.last_activity = getMonotonicMs();

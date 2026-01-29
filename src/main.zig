@@ -270,7 +270,15 @@ const ProxyContext = struct {
             // 此时 SM 应该处于 BODY 状态或 READY for next
 
             // 安全检查：Rate Limit
-            if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) return false;
+            if (!(try self.rate_limiter.checkLimit(conn.real_ip_cached))) {
+                std.debug.print("[SECURITY] Rate Limit Triggered IP:{d}.{d}.{d}.{d}\n", .{
+                    (conn.real_ip_cached >> 24) & 0xFF,
+                    (conn.real_ip_cached >> 16) & 0xFF,
+                    (conn.real_ip_cached >> 8) & 0xFF,
+                    conn.real_ip_cached & 0xFF,
+                });
+                return false;
+            }
 
             // 5. 健康检查
             if (self.consecutive_failures >= HEALTH_THRESHOLD) {
@@ -292,6 +300,12 @@ const ProxyContext = struct {
             conn.c2s_len = conn.s2c_len;
             conn.s2c_len = 0; // Clear temp use
 
+            std.debug.print("[ACCESS] Allowed IP:{d}.{d}.{d}.{d}\n", .{
+                (conn.real_ip_cached >> 24) & 0xFF,
+                (conn.real_ip_cached >> 16) & 0xFF,
+                (conn.real_ip_cached >> 8) & 0xFF,
+                conn.real_ip_cached & 0xFF,
+            });
             _ = try self.connectToBackend(engine, slot);
             return true;
         }
