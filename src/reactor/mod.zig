@@ -86,7 +86,8 @@ pub const Engine = struct {
 
     // 多路复用后端
     backend_fd: if (is_linux) posix.fd_t else void = if (is_linux) undefined else {},
-    epoll_events: if (is_linux) []posix.system.epoll_event else void = if (is_linux) undefined else {},
+    epoll_events: if (is_linux) []std.os.linux.epoll_event else void = if (is_linux) undefined else {},
+
     poll_fds: if (!is_linux) []posix.pollfd else void = if (!is_linux) undefined else {},
 
     poll_meta: []PollMeta,
@@ -125,7 +126,7 @@ pub const Engine = struct {
 
         if (comptime is_linux) {
             self.backend_fd = try posix.epoll_create1(0);
-            self.epoll_events = try allocator.alloc(posix.system.epoll_event, poll_cap);
+            self.epoll_events = try allocator.alloc(std.os.linux.epoll_event, poll_cap);
         } else {
             self.poll_fds = try allocator.alloc(posix.pollfd, poll_cap);
         }
@@ -160,11 +161,11 @@ pub const Engine = struct {
         if (comptime is_linux) {
             const kind_val: u32 = if (kind == .client) 1 else if (kind == .server) 2 else 0;
             const tag: u32 = (@as(u32, @intCast(slot)) + 1) << 2 | kind_val;
-            var ev = posix.system.epoll_event{
-                .events = posix.system.EPOLL.IN | posix.system.EPOLL.OUT | posix.system.EPOLL.RDHUP,
+            var ev = std.os.linux.epoll_event{
+                .events = std.os.linux.EPOLL.IN | std.os.linux.EPOLL.OUT | std.os.linux.EPOLL.RDHUP,
                 .data = .{ .u32 = tag },
             };
-            try posix.epoll_ctl(self.backend_fd, posix.system.EPOLL.CTL_ADD, fd, &ev);
+            try posix.epoll_ctl(self.backend_fd, std.os.linux.EPOLL.CTL_ADD, fd, &ev);
         } else {
             self.poll_fds[idx] = .{ .fd = fd, .events = posix.POLL.IN, .revents = 0 };
         }
@@ -175,7 +176,7 @@ pub const Engine = struct {
         var i: usize = 0;
         while (i < self.poll_count) {
             if (self.poll_meta[i].fd == fd) {
-                if (comptime is_linux) posix.epoll_ctl(self.backend_fd, posix.system.EPOLL.CTL_DEL, fd, null) catch {};
+                if (comptime is_linux) posix.epoll_ctl(self.backend_fd, std.os.linux.EPOLL.CTL_DEL, fd, null) catch {};
                 if (i < self.poll_count - 1) {
                     const last_idx = self.poll_count - 1;
                     self.poll_meta[i] = self.poll_meta[last_idx];
@@ -199,7 +200,7 @@ pub const Engine = struct {
         while (i < self.poll_count) {
             if (self.poll_meta[i].slot_index == slot) {
                 const fd = self.poll_meta[i].fd;
-                if (comptime is_linux) posix.epoll_ctl(self.backend_fd, posix.system.EPOLL.CTL_DEL, fd, null) catch {};
+                if (comptime is_linux) posix.epoll_ctl(self.backend_fd, std.os.linux.EPOLL.CTL_DEL, fd, null) catch {};
 
                 // Swap with last element to remove in O(1)
                 const last = self.poll_count - 1;
@@ -288,9 +289,9 @@ pub const Engine = struct {
     fn translateEpollEvents(self: Engine, events: u32) i16 {
         _ = self;
         var res: i16 = 0;
-        if (events & posix.system.EPOLL.IN != 0) res |= posix.POLL.IN;
-        if (events & posix.system.EPOLL.OUT != 0) res |= posix.POLL.OUT;
-        if (events & (posix.system.EPOLL.ERR | posix.system.EPOLL.HUP | posix.system.EPOLL.RDHUP) != 0) res |= posix.POLL.HUP;
+        if (events & std.os.linux.EPOLL.IN != 0) res |= posix.POLL.IN;
+        if (events & std.os.linux.EPOLL.OUT != 0) res |= posix.POLL.OUT;
+        if (events & (std.os.linux.EPOLL.ERR | std.os.linux.EPOLL.HUP | std.os.linux.EPOLL.RDHUP) != 0) res |= posix.POLL.HUP;
         return res;
     }
 
@@ -422,13 +423,13 @@ pub const Engine = struct {
         }
         if (comptime is_linux) {
             const kind_val: u32 = if (meta.kind == .client) 1 else if (meta.kind == .server) 2 else 0;
-            var ev = posix.system.epoll_event{
-                .events = posix.system.EPOLL.RDHUP,
+            var ev = std.os.linux.epoll_event{
+                .events = std.os.linux.EPOLL.RDHUP,
                 .data = .{ .u32 = (@as(u32, @intCast(meta.slot_index)) + 1) << 2 | kind_val },
             };
-            if (desired_events & posix.POLL.IN != 0) ev.events |= posix.system.EPOLL.IN;
-            if (desired_events & posix.POLL.OUT != 0) ev.events |= posix.system.EPOLL.OUT;
-            posix.epoll_ctl(self.backend_fd, posix.system.EPOLL.CTL_MOD, meta.fd, &ev) catch {};
+            if (desired_events & posix.POLL.IN != 0) ev.events |= std.os.linux.EPOLL.IN;
+            if (desired_events & posix.POLL.OUT != 0) ev.events |= std.os.linux.EPOLL.OUT;
+            posix.epoll_ctl(self.backend_fd, std.os.linux.EPOLL.CTL_MOD, meta.fd, &ev) catch {};
         } else {
             self.poll_fds[index].events = @intCast(desired_events);
         }
